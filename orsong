@@ -1,0 +1,151 @@
+#!/usr/bin/env python3
+"""Generate music via OpenRouter — CLI.
+
+Usage:
+  orsong "prompt" [-o output.mp3] [-m model] [--lyrics] [--clip] [-q]
+
+Models:
+  google/lyria-3-pro-preview   — Full song (~3min), $0.08 (default)
+  google/lyria-3-clip-preview  — Short clip (30s), $0.04
+
+Config: $OPENROUTER_API_KEY or ~/.config/openrouter/api_key
+"""
+
+import argparse, base64, json, os, sys, urllib.request, urllib.error
+
+API_URL = "https://openrouter.ai/api/v1/chat/completions"
+DEFAULT_MODEL = "google/lyria-3-pro-preview"
+CLIP_MODEL = "google/lyria-3-clip-preview"
+
+def get_api_key():
+    key = os.environ.get("OPENROUTER_API_KEY")
+    if key:
+        return key
+    kf = os.path.expanduser("~/.config/openrouter/api_key")
+    try:
+        with open(kf) as f:
+            return f.read().strip()
+    except FileNotFoundError:
+        return None
+
+def main():
+    p = argparse.ArgumentParser(
+        description="Generate music via OpenRouter (Lyria)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    p.add_argument("prompt", nargs="?", help="Describe the music you want")
+    p.add_argument("-o", "--output", help="Output MP3 file (default: output.mp3)")
+    p.add_argument("-m", "--model",
+                   default=os.environ.get("ORSONG_MODEL", DEFAULT_MODEL),
+                   help="Model slug")
+    p.add_argument("--clip", action="store_true",
+                   help="Shortcut for lyria-3-clip-preview (30s, $0.04)")
+    p.add_argument("--lyrics", action="store_true",
+                   help="Also print lyrics to stdout")
+    p.add_argument("-q", "--quiet", action="store_true",
+                   help="Only print output path")
+    args = p.parse_args()
+
+    if args.clip:
+        args.model = CLIP_MODEL
+
+    api_key = get_api_key()
+    if not api_key:
+        print("Error: No OpenRouter API key found.", file=sys.stderr)
+        print("Set OPENROUTER_API_KEY env var or write to ~/.config/openrouter/api_key",
+              file=sys.stderr)
+        sys.exit(1)
+
+    if not args.prompt:
+        p.print_help()
+        sys.exit(1)
+
+    payload = {
+        "model": args.model,
+        "messages": [{"role": "user", "content": args.prompt}],
+        "modalities": ["audio", "text"],
+        "stream": True,
+    }
+
+    body = json.dumps(payload).encode()
+    req = urllib.request.Request(
+        API_URL,
+        data=body,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://github.com/capi/or-scripts/orsong",
+        },
+        method="POST",
+    )
+
+    # Lyria Pro kann bis zu 3+ Minuten brauchen – grosszügiger Timeout
+    try:
+        resp = urllib.request.urlopen(req, timeout=300)
+    except urllib.error.HTTPError as e:
+        detail = ""
+        try:
+            detail = ": " + e.read().decode().strip()
+        except Exception:
+            pass
+        print(f"Error {e.code}{detail}", file=sys.stderr)
+        sys.exit(1)
+    except urllib.error.URLError as e:
+        print(f"Network error: {e.reason}", file=sys.stderr)
+        sys.exit(1)
+
+    audio_chunks = []
+    lyrics = []
+
+    for raw_line in resp:
+        line = raw_line.decode("utf-8", errors="replace").strip()
+        if not line:
+            continue
+        # skip processing heartbeats
+        if line.startswith(":"):
+            continue
+        if not line.startswith("data: "):
+            continue
+        data = line[6:]
+        if data == "[DONE]":
+            break
+        try:
+            chunk = json.loads(data)
+        except json.JSONDecodeError:
+            continue
+        choices = chunk.get("choices", [])
+        if not choices:
+            continue
+        delta = choices[0].get("delta", {})
+        if delta.get("content"):
+            lyrics.append(delta["content"])
+        if delta.get("audio"):
+            aud = delta["audio"]
+            if aud.get("data"):
+                audio_chunks.append(aud["data"])
+
+    if not audio_chunks:
+        print("Error: No audio received in response.", file=sys.stderr)
+        print("Lyrics:", "".join(lyrics), file=sys.stderr)
+        sys.exit(1)
+
+    # Decode and save
+    if args.lyrics or (not args.quiet and lyrics):
+        print("\n".join(lyrics))
+
+    full_b64 = "".join(audio_chunks)
+    raw = base64.b64decode(full_b64)
+
+    outpath = args.output or "output.mp3"
+    with open(outpath, "wb") as f:
+        f.write(raw)
+    saved = os.path.abspath(outpath)
+
+    if args.quiet:
+        print(saved)
+    else:
+        print(f"Saved: {saved}  ({len(raw)} bytes)")
+
+if __name__ == "__main__":
+    main()

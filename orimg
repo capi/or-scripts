@@ -1,0 +1,168 @@
+#!/usr/bin/env python3
+"""Generate images via OpenRouter — CLI.
+
+Usage:
+  orimg "prompt" [-o output.png] [-m model] [-r 16:9] [-s 1K|2K|4K] [-q]
+
+Models (cheapest first):
+  google/gemini-2.5-flash-image   — default, cheap, good
+  google/gemini-3-pro-image-preview — best quality, pricier
+  black-forest-labs/flux.2-pro    — FLUX.2 Pro
+  sourceful/riverflow-v2-standard-preview
+
+Config: $OPENROUTER_API_KEY or ~/.config/openrouter/api_key
+"""
+
+import argparse, base64, json, os, sys, urllib.request, urllib.error, re
+
+API_URL = "https://openrouter.ai/api/v1/chat/completions"
+DEFAULT_MODEL = "google/gemini-2.5-flash-image"
+
+def get_api_key():
+    key = os.environ.get("OPENROUTER_API_KEY")
+    if key:
+        return key
+    kf = os.path.expanduser("~/.config/openrouter/api_key")
+    try:
+        with open(kf) as f:
+            return f.read().strip()
+    except FileNotFoundError:
+        return None
+
+def save_image(b64data, path):
+    # data:image/png;base64,iVBOR...
+    match = re.match(r'data:image/(\w+);base64,(.+)', b64data)
+    if match:
+        ext = match.group(1)
+        data = match.group(2)
+        if ext == "jpeg":
+            ext = "jpg"
+    else:
+        ext = "png"
+        data = b64data
+    raw = base64.b64decode(data)
+    if not path:
+        path = f"output.{ext}"
+    with open(path, "wb") as f:
+        f.write(raw)
+    return os.path.abspath(path)
+
+def main():
+    p = argparse.ArgumentParser(
+        description="Generate an image via OpenRouter",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    p.add_argument("prompt", nargs="?", help="Text prompt for the image")
+    p.add_argument("-o", "--output", help="Output file path (default: output.<ext>)")
+    p.add_argument("-m", "--model", default=os.environ.get("ORIMG_MODEL", DEFAULT_MODEL),
+                   help=f"Model slug (default: {DEFAULT_MODEL})")
+    p.add_argument("-r", "--aspect-ratio", help="e.g. 16:9, 4:3, 1:1, 9:16")
+    p.add_argument("-s", "--image-size", choices=["0.5K","1K","2K","4K"],
+                   help="Resolution tier (default: 1K)")
+    p.add_argument("-q", "--quiet", action="store_true", help="Only print output path")
+    p.add_argument("-l", "--list-models", action="store_true",
+                   help="List recommended image models and exit")
+    args = p.parse_args()
+
+    if args.list_models:
+        models = [
+            ("google/gemini-2.5-flash-image", "Cheap & fast (default)"),
+            ("google/gemini-3-pro-image-preview", "Best quality"),
+            ("google/gemini-3.1-flash-image-preview", "Extended aspect ratios"),
+            ("black-forest-labs/flux.2-pro", "FLUX.2 Pro"),
+            ("black-forest-labs/flux.2-flex", "FLUX.2 Flex"),
+            ("recraft/recraft-v4", "Recraft V4"),
+            ("recraft/recraft-v4-pro", "Recraft V4 Pro"),
+            ("sourceful/riverflow-v2-standard-preview", "Sourceful V2"),
+        ]
+        print("Available image models:\n")
+        for slug, desc in models:
+            print(f"  {slug:55s}  {desc}")
+        sys.exit(0)
+
+    api_key = get_api_key()
+    if not api_key:
+        print("Error: No OpenRouter API key found.", file=sys.stderr)
+        print("Set OPENROUTER_API_KEY env var or write to ~/.config/openrouter/api_key",
+              file=sys.stderr)
+        sys.exit(1)
+
+    if not args.prompt:
+        p.print_help()
+        sys.exit(1)
+
+    payload = {
+        "model": args.model,
+        "messages": [{"role": "user", "content": args.prompt}],
+        "modalities": ["image", "text"],
+    }
+
+    # Model-specific check — image-only models need modalities: ["image"]
+    if any(x in args.model for x in ["flux", "recraft/recraft-v4", "sourceful"]):
+        payload["modalities"] = ["image"]
+
+    if args.aspect_ratio or args.image_size:
+        payload["image_config"] = {}
+        if args.aspect_ratio:
+            payload["image_config"]["aspect_ratio"] = args.aspect_ratio
+        if args.image_size:
+            payload["image_config"]["image_size"] = args.image_size
+
+    body = json.dumps(payload).encode()
+    req = urllib.request.Request(
+        API_URL,
+        data=body,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://github.com/capi/or-scripts/orimg",
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            result = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        detail = ""
+        try:
+            detail = ": " + e.read().decode().strip()
+        except Exception:
+            pass
+        print(f"Error {e.code}{detail}", file=sys.stderr)
+        sys.exit(1)
+    except urllib.error.URLError as e:
+        print(f"Network error: {e.reason}", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        images = result["choices"][0]["message"]["images"]
+    except (KeyError, IndexError, TypeError):
+        print("No images in response.", file=sys.stderr)
+        print("Full response:", json.dumps(result, indent=2)[:1000], file=sys.stderr)
+        sys.exit(1)
+
+    # Also print text if the model returned any
+    content = result.get("choices",[{}])[0].get("message",{}).get("content","")
+    if content and not args.quiet:
+        print(content)
+
+    for i, img in enumerate(images):
+        url = img["image_url"]["url"]
+        fpath = args.output
+        if len(images) > 1 and not args.output:
+            # multiple images: append index
+            base, ext = os.path.splitext("output.png")
+            fpath = f"{base}_{i}{ext}"
+        elif len(images) > 1 and args.output:
+            base, ext = os.path.splitext(args.output)
+            fpath = f"{base}_{i}{ext}"
+        saved = save_image(url, fpath)
+        if args.quiet:
+            print(saved)
+        else:
+            print(f"Saved: {saved}  ({os.path.getsize(saved)} bytes)")
+
+if __name__ == "__main__":
+    main()
